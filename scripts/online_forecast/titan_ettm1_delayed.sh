@@ -27,7 +27,7 @@ python -u run.py \
   --pred_len 96 \
   --enc_in 7 --dec_in 7 --c_out 7 \
   --d_model 256 --n_heads 4 --e_layers 2 --d_ff 512 \
-  --train_epochs 30 --batch_size 32 --patience 7 \
+  --train_epochs 15 --batch_size 32 --patience 3 \
   --learning_rate 5e-4 \
   --lradj cosine \
   --chunk_size 0 \

@@ -265,12 +265,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                             if len(outputs) > 1 and isinstance(outputs[1], torch.Tensor):
                                 loss_proxy = outputs[1]
                             # [修复 1.3] 提取更新后的记忆状态（如果有）
+                            # [修复 1.4] 必须 detach() 避免计算图累积导致显存泄露和速度下降
                             if len(outputs) > 2 and isinstance(outputs[2], dict):
                                 stats = outputs[2]
                                 if stats.get('updated_memory') is not None:
-                                    temp_memory = stats['updated_memory']
+                                    temp_memory = stats['updated_memory'].detach()
                                 if stats.get('updated_momentum') is not None:
-                                    temp_momentum = stats['updated_momentum']
+                                    temp_momentum = stats['updated_momentum'].detach()
                         else:
                             pred = outputs
 
@@ -365,6 +366,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     scaler.update()
                 else:
                     model_optim.step()
+
+                # [修复 1.4] 清理中间变量，避免计算图累积
+                del loss, loss_chunks, loss_pred_vals, loss_proxy_vals, loss_orth_vals
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # End of Epoch Loop
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))

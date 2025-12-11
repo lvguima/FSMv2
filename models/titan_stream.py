@@ -64,8 +64,28 @@ class TitanStream(nn.Module):
             num_layers=max(1, getattr(configs, "e_layers", 2))
         )
 
-        # Forecast head: pooled token -> horizon * channels
-        self.forecast_head = nn.Linear(self.d_model, self.pred_len * self.c_out)
+        # [改进] Forecast head: Attention Pooling + 2-layer MLP
+        # 使用可学习的 attention 来聚合 core_out，而非简单 mean pooling
+        # 这样既保留了时序信息，又避免了 flatten 导致的参数爆炸
+        forecast_hidden_dim_config = getattr(configs, "forecast_hidden_dim", 0)
+        self.forecast_hidden_dim = forecast_hidden_dim_config if forecast_hidden_dim_config > 0 else self.d_model * 2
+
+        # Attention pooling: 学习一个 query 向量来聚合所有 token
+        self.forecast_query = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        self.forecast_attn = nn.MultiheadAttention(
+            embed_dim=self.d_model,
+            num_heads=self.n_heads,
+            dropout=self.dropout,
+            batch_first=False  # [S, B, D] format
+        )
+
+        # 2-layer MLP for final prediction
+        self.forecast_head = nn.Sequential(
+            nn.Linear(self.d_model, self.forecast_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.forecast_hidden_dim, self.pred_len * self.c_out)
+        )
 
         # Learnable initial memory state; online state buffers are updated in-place
         self.memory_init = nn.Parameter(torch.zeros(self.d_model, self.d_model))
@@ -223,7 +243,12 @@ class TitanStream(nn.Module):
         core_tokens = torch.cat([h_pers, h_mem, x_proj], dim=1)  # [B, 3L, D]
         core_in = core_tokens.transpose(0, 1)  # [S, B, D] for TransformerEncoder
         core_out = self.core(core_in)  # [S, B, D]
-        pooled = core_out.mean(dim=0)  # [B, D]
+
+        # [改进] Attention Pooling + 2-layer MLP (保留时序信息，避免参数爆炸)
+        # 使用可学习的 query 向量通过 attention 聚合所有 token
+        query = self.forecast_query.expand(-1, B, -1)  # [1, B, D]
+        pooled, _ = self.forecast_attn(query, core_out, core_out)  # [1, B, D]
+        pooled = pooled.squeeze(0)  # [B, D]
 
         forecast = self.forecast_head(pooled)  # [B, pred_len * c_out]
         pred = forecast.view(B, self.pred_len, self.c_out)

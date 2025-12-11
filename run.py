@@ -193,6 +193,7 @@ if __name__ == '__main__':
     parser.add_argument('--beta_momentum', type=float, default=0.9, help='TitanStream: momentum coefficient for memory')
     parser.add_argument('--lr_memory', type=float, default=0.01, help='TitanStream: learning rate for memory updates')
     parser.add_argument('--gate_hidden', type=int, default=128, help='TitanStream: hidden size of forgetting gate MLP')
+    parser.add_argument('--forecast_hidden_dim', type=int, default=0, help='TitanStream: hidden dim for forecast head (0=auto: 2*d_model)')
     parser.add_argument('--chunk_size', type=int, default=0, help='TitanStream: optional chunk length for BPTT (0=disable)')
     parser.add_argument('--chunk_len', type=int, default=0, help='TitanStream: time-dimension chunk length (0=disable)')
     parser.add_argument('--use_high_order', action='store_true', help='TitanStream: enable high-order gradients (may be heavy)', default=False)

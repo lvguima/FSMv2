@@ -494,3 +494,53 @@ def _update_online_memory(self, grad_mem, gate_value):
 
 *文档创建时间：2025-12-11*
 *最后更新：2025-12-11 - 完成 P0/P1 修复*
+
+---
+
+## 🔴 问题 7：计算图累积导致显存泄露和速度下降（新发现 - P0）
+
+**发现时间**：2025-12-11
+
+**问题描述**：
+- 在训练时，`temp_memory` 和 `temp_momentum` 在 time_slices 之间传递时没有 `.detach()`
+- 导致计算图跨 slice 累积，每个 epoch 速度指数级下降
+
+**代码位置**：`exp/exp_long_term_forecasting.py:271-273`
+```python
+# 问题代码
+if stats.get('updated_memory') is not None:
+    temp_memory = stats['updated_memory']  # ❌ 没有 detach()
+if stats.get('updated_momentum') is not None:
+    temp_momentum = stats['updated_momentum']  # ❌ 没有 detach()
+```
+
+**影响**：
+- **显存爆炸**：计算图在 batch 内跨 slice 累积
+- **速度指数级下降**：Epoch 1 (0.26s/iter) → Epoch 6 (3.7s/iter)
+- **最终 OOM**：显存耗尽导致训练崩溃
+
+**症状**：
+- 随着 epoch 增加，每个 epoch 耗时越来越长
+- 显存占用持续增长
+- 反向传播时间显著增加
+
+**修复方案**：
+```python
+# 修复代码
+if stats.get('updated_memory') is not None:
+    temp_memory = stats['updated_memory'].detach()  # ✅ 截断计算图
+if stats.get('updated_momentum') is not None:
+    temp_momentum = stats['updated_momentum'].detach()  # ✅ 截断计算图
+```
+
+**额外优化**：
+```python
+# 在每个 batch 结束后清理中间变量
+del loss, loss_chunks, loss_pred_vals, loss_proxy_vals, loss_orth_vals
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+```
+
+**状态**：✅ 已修复（2025-12-11）
+
+---

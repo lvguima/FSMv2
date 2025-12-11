@@ -86,10 +86,17 @@ for t, (t_start, t_end) in enumerate(time_slices):
         external_memory=temp_memory,  # Pass memory externally
         external_momentum=temp_momentum
     )
-    # Extract updated memory from stats
-    temp_memory = stats['updated_memory']
-    temp_momentum = stats['updated_momentum']
+    # [CRITICAL] Extract updated memory from stats and DETACH to prevent graph accumulation
+    if stats.get('updated_memory') is not None:
+        temp_memory = stats['updated_memory'].detach()  # Must detach!
+    if stats.get('updated_momentum') is not None:
+        temp_momentum = stats['updated_momentum'].detach()  # Must detach!
 ```
+
+**Why `.detach()` is critical**: Without detaching, computation graphs accumulate across time slices, causing:
+- Exponential slowdown (0.26s/iter → 3.7s/iter over epochs)
+- Memory leak and eventual OOM
+- Backward pass traversing entire history instead of single slice
 
 #### 2. Differentiable Memory Updates
 
@@ -117,6 +124,28 @@ The design uses `H_mem = M · Q` (memory as linear transformation matrix), not s
 
 See `FSMdesign.md` lines 35-39 for detailed explanation.
 
+### Forecast Head Architecture (REDESIGNED)
+
+**Problem**: Original design used mean pooling which discarded all temporal information:
+```python
+pooled = core_out.mean(dim=0)  # [B, D] - loses time structure
+forecast = Linear(D, pred_len * c_out)
+```
+
+**Solution**: Attention Pooling + 2-layer MLP preserves temporal information:
+```python
+# Learnable query vector attends to all tokens
+query = forecast_query.expand(-1, B, -1)  # [1, B, D]
+pooled, _ = forecast_attn(query, core_out, core_out)  # [1, B, D]
+pooled = pooled.squeeze(0)  # [B, D]
+
+# 2-layer MLP for prediction
+hidden = Linear(D, 2D) + GELU + Dropout
+forecast = Linear(2D, pred_len * c_out)
+```
+
+**Why not Flatten + MLP?**: With seq_len=512, flattening creates 393K input dimensions → 201M parameters (99% of model). Attention pooling keeps parameters reasonable (740K, 35% of model) while learning which time steps matter.
+
 ## Key Parameters
 
 ### Titan-Stream Specific
@@ -125,6 +154,7 @@ See `FSMdesign.md` lines 35-39 for detailed explanation.
 - `--beta_momentum 0.9`: Momentum coefficient for memory updates
 - `--lr_memory 0.01`: Learning rate for online memory updates
 - `--gate_hidden 128`: Hidden size of forgetting gate MLP
+- `--forecast_hidden_dim 0`: Forecast head hidden dim (0=auto: 2*d_model)
 - `--chunk_len 128`: Time-dimension chunk length (0=disable)
 - `--use_high_order`: Enable differentiable memory updates (meta-learning)
 - `--clip_grad 1.0`: Gradient clipping max norm
@@ -216,12 +246,20 @@ Located in `models/`:
 2. **Differentiable updates**: Added `_update_memory_differentiable()` for meta-learning
 3. **Training memory continuation**: Memory now continues across chunks via external parameters
 4. **Inplace operation fix**: Memory passed as parameters instead of buffer modification
+5. **🔴 Computation graph accumulation fix**: Added `.detach()` to `temp_memory` and `temp_momentum` to prevent graph accumulation across time slices, which caused exponential slowdown (Epoch 1: 0.26s/iter → Epoch 6: 3.7s/iter)
 
 ### P1 Performance Improvements (Completed)
 
-5. **Gradient normalization**: Threshold lowered from 1e3 to 10.0
-6. **Persistent memory tuning**: Added `freeze_persistent()`/`unfreeze_persistent()` methods
-7. **H_mem semantics**: Clarified in design docs
+6. **Gradient normalization**: Threshold lowered from 1e3 to 10.0
+7. **Persistent memory tuning**: Added `freeze_persistent()`/`unfreeze_persistent()` methods
+8. **H_mem semantics**: Clarified in design docs
+9. **Forecast head redesign**: Replaced mean pooling with Attention Pooling + 2-layer MLP to preserve temporal information while avoiding parameter explosion
+
+### Experiment Configuration Fixes (Completed)
+
+10. **Checkpoint path consistency**: Unified `data` parameter between offline training and online testing (both use same dataset name)
+11. **Training hyperparameters**: Increased patience (3→7), adjusted learning rate (1e-3→5e-4), switched to cosine scheduler
+12. **Backbone parameter grouping**: Fixed parameter classification for TitanStream (added `core`, `input_proj`, `q/k/v_proj` to backbone keywords)
 
 See `TITAN_STREAM_FIX_PLAN.md` for detailed fix documentation.
 
@@ -238,7 +276,13 @@ See `TITAN_STREAM_FIX_PLAN.md` for detailed fix documentation.
 - Always reset memory at batch level, not epoch level
 - Use `external_memory`/`external_momentum` parameters to pass memory state
 - Never use inplace operations on buffers when `use_high_order=True`
-- Extract updated memory from `stats` dict returned by forward pass
+- **CRITICAL**: Always `.detach()` when extracting updated memory from `stats` dict to prevent graph accumulation
+- Clean up intermediate variables after backward pass to prevent memory leaks:
+  ```python
+  del loss, loss_chunks, loss_pred_vals, loss_proxy_vals, loss_orth_vals
+  if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+  ```
 
 ### When Adding New Models
 

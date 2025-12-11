@@ -27,7 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
-                        help='model name, options: [Autoformer, Transformer, TimesNet, MStream]')
+                        help='model name, options: [Autoformer, Transformer, TimesNet, MStream, TitanStream]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='ETTh1', help='dataset type')
@@ -104,6 +104,16 @@ if __name__ == '__main__':
     parser.add_argument('--lr_ttt', type=float, default=0.001, help='M-Stream: learning rate for TTT')
     parser.add_argument('--lambda_proxy', type=float, default=0.1, help='v6.0: weight for proxy loss')
     parser.add_argument('--lambda_orth', type=float, default=0.05, help='v6.0: weight for orthogonal loss')
+
+    # Titan-Stream Specific
+    parser.add_argument('--n_persistent', type=int, default=32, help='TitanStream: number of persistent memory tokens')
+    parser.add_argument('--beta_momentum', type=float, default=0.9, help='TitanStream: momentum coefficient for memory')
+    parser.add_argument('--lr_memory', type=float, default=0.01, help='TitanStream: learning rate for memory updates')
+    parser.add_argument('--gate_hidden', type=int, default=128, help='TitanStream: hidden size of forgetting gate MLP')
+    parser.add_argument('--chunk_size', type=int, default=0, help='TitanStream: optional chunk length for BPTT (0=disable)')
+    parser.add_argument('--chunk_len', type=int, default=0, help='TitanStream: time-dimension chunk length (0=disable)')
+    parser.add_argument('--use_high_order', action='store_true', help='TitanStream: enable high-order gradients (may be heavy)', default=False)
+    parser.add_argument('--clip_grad', type=float, default=0.0, help='Gradient clipping max norm (0 to disable)')
     
     # Online Strategy
     parser.add_argument('--online_strategy', type=str, default='proxy', help='proxy/naive_ft/static/replay/refresh')
@@ -118,6 +128,9 @@ if __name__ == '__main__':
     parser.add_argument('--delayed_max_wait_steps', type=int, default=20, help='Max wait steps for delayed feedback')
     parser.add_argument('--delayed_weight_decay', type=float, default=0.05, help='Time decay for delayed samples')
     parser.add_argument('--delayed_supervised_weight', type=float, default=0.7, help='Weight of supervised loss in delayed update')
+    parser.add_argument('--delayed_weight_temperature', type=float, default=1.0, help='Temperature for delayed weight softmax (lower=sharper)')
+    parser.add_argument('--delayed_anomaly_boost', type=float, default=1.0, help='Multiplier for weights when anomaly-triggered update')
+    parser.add_argument('--delayed_min_ready', type=int, default=1, help='Minimum ready samples to allow anomaly-triggered update')
     parser.add_argument('--delayed_horizon', type=int, default=96, help='Delay horizon (usually pred_len)')
     
     # Other Strategies Args

@@ -26,11 +26,17 @@
 
 * **输入/输出流**：
     * **Input**: 当前滑窗数据的 Embedding $X_t \in \mathbb{R}^{L \times D}$。
-    * **Projections**: 
+    * **Projections**:
         * $Q_{mem} = X_t W_Q$
         * $K_{mem} = X_t W_K$
         * $V_{mem} = X_t W_V$
     * **Output**: 动态上下文特征 $H_{mem} = M_{t-1} \cdot Q_{mem}$ (利用上一时刻的记忆预测当前)。
+
+    **[实现说明 - 修复 2.3]**:
+    - 这里的 $H_{mem} = M \cdot Q$ 表示**记忆作为线性变换矩阵**，将 Query 映射到上下文空间。
+    - 这与标准 Linear Attention 的 $H = Q \cdot M$ 不同，后者是 Query 左乘记忆。
+    - 我们的设计选择使得记忆 $M$ 扮演"特征变换器"的角色，而非"键值缓存"。
+    - 这种设计允许记忆直接调制输入特征，更适合捕捉非平稳的动态变换。
 
 * **内部组件设计**：
     1.  **记忆状态 (Memory State)**: 一个可学习的矩阵 $M$, 初始化为零或随机小值。

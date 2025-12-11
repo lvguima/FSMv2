@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import torch
 import torch.backends
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
@@ -12,11 +13,89 @@ from exp.exp_online_forecast import Exp_Online_Forecast
 from utils.print_args import print_args
 import random
 import numpy as np
+from contextlib import contextmanager
+
+
+@contextmanager
+def tee_stdout_stderr(log_path):
+    """Mirror stdout/stderr to a log file while keeping console output."""
+    log_file = None
+    prev_out, prev_err = sys.stdout, sys.stderr
+
+    try:
+        # 创建日志目录
+        log_dir = os.path.dirname(log_path)
+        if log_dir:  # 只有当目录路径非空时才创建
+            os.makedirs(log_dir, exist_ok=True)
+
+        # 打开日志文件
+        log_file = open(log_path, 'w', encoding='utf-8')
+
+        class _TeeStream:
+            def __init__(self, stream, file_handle):
+                self.stream = stream
+                self.file_handle = file_handle
+
+            def write(self, data):
+                self.stream.write(data)
+                if self.file_handle and not self.file_handle.closed:
+                    try:
+                        self.file_handle.write(data)
+                    except (OSError, IOError):
+                        pass  # 静默失败，不影响主程序
+
+            def flush(self):
+                self.stream.flush()
+                if self.file_handle and not self.file_handle.closed:
+                    try:
+                        self.file_handle.flush()
+                    except (OSError, IOError):
+                        pass
+
+        sys.stdout = _TeeStream(prev_out, log_file)
+        sys.stderr = _TeeStream(prev_err, log_file)
+
+        yield
+
+    except (OSError, IOError) as e:
+        print(f"Warning: Failed to create log file at {log_path}: {e}", file=prev_err)
+        print("Continuing without logging to file...", file=prev_err)
+        yield  # 继续执行，但不记录日志
+
+    finally:
+        # 恢复标准输出/错误
+        sys.stdout, sys.stderr = prev_out, prev_err
+
+        # 关闭日志文件
+        if log_file and not log_file.closed:
+            try:
+                log_file.close()
+            except (OSError, IOError):
+                pass
+
 
 def setup_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def configure_device(args):
+    if torch.cuda.is_available() and args.use_gpu:
+        args.device = torch.device('cuda:{}'.format(args.gpu))
+        print('Using GPU')
+    else:
+        if hasattr(torch.backends, "mps"):
+            args.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        else:
+            args.device = torch.device("cpu")
+        print('Using cpu or mps')
+
+    if args.use_gpu and args.use_multi_gpu:
+        args.devices = args.devices.replace(' ', '')
+        device_ids = args.devices.split(',')
+        args.device_ids = [int(id_) for id_ in device_ids]
+        args.gpu = args.device_ids[0]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TimesNet')
@@ -28,7 +107,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
                         help='model name, options: [Autoformer, Transformer, TimesNet, MStream, TitanStream]')
-
+    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')
     # data loader
     parser.add_argument('--data', type=str, required=True, default='ETTh1', help='dataset type')
     parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of the data file')
@@ -39,9 +118,14 @@ if __name__ == '__main__':
     parser.add_argument('--freq', type=str, default='h',
                         help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
-    
+
+    # [日志和结果目录配置]
+    parser.add_argument('--log_dir', type=str, default='./log/', help='root directory for console logs')
+    parser.add_argument('--result_dir', type=str, default='./results/', help='root directory for results')
+    parser.add_argument('--test_result_dir', type=str, default='./test_results/', help='root directory for test visualizations')
+
     # [关键参数] 手动指定 checkpoint setting 文件夹名
-    parser.add_argument('--checkpoint_setting', type=str, default=None, 
+    parser.add_argument('--checkpoint_setting', type=str, default=None,
                         help='Manually specify the setting folder name to load checkpoints from')
 
     # [关键参数] Online Mode 选择 (对应 online_runner.py 的 mode)
@@ -89,7 +173,6 @@ if __name__ == '__main__':
                         help='0: channel dependence 1: channel independence for FreTS model')
     parser.add_argument('--decomp_method', type=str, default='moving_avg',
                         help='method of series decompsition, only support moving_avg or dft_decomp')
-    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize; True 1 False 0')
     parser.add_argument('--down_sampling_layers', type=int, default=0, help='num of down sampling layers')
     parser.add_argument('--down_sampling_window', type=int, default=1, help='down sampling window size')
     parser.add_argument('--down_sampling_method', type=str, default=None,
@@ -114,6 +197,7 @@ if __name__ == '__main__':
     parser.add_argument('--chunk_len', type=int, default=0, help='TitanStream: time-dimension chunk length (0=disable)')
     parser.add_argument('--use_high_order', action='store_true', help='TitanStream: enable high-order gradients (may be heavy)', default=False)
     parser.add_argument('--clip_grad', type=float, default=0.0, help='Gradient clipping max norm (0 to disable)')
+    parser.add_argument('--persistent_lr_scale', type=float, default=0.0, help='[修复 2.2] TitanStream: LR scale for Persistent Memory online fine-tuning (0=freeze, 0.01=1%% of base LR)')
     
     # Online Strategy
     parser.add_argument('--online_strategy', type=str, default='proxy', help='proxy/naive_ft/static/replay/refresh')
@@ -217,26 +301,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     
-    # GPU Configuration
-    if torch.cuda.is_available() and args.use_gpu:
-        args.device = torch.device('cuda:{}'.format(args.gpu))
-        print('Using GPU')
-    else:
-        if hasattr(torch.backends, "mps"):
-            args.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        else:
-            args.device = torch.device("cpu")
-        print('Using cpu or mps')
-
-    if args.use_gpu and args.use_multi_gpu:
-        args.devices = args.devices.replace(' ', '')
-        device_ids = args.devices.split(',')
-        args.device_ids = [int(id_) for id_ in device_ids]
-        args.gpu = args.device_ids[0]
-
-    print('Args in experiment:')
-    print_args(args)
-
     # Exp selection
     if args.task_name == 'long_term_forecast':
         Exp = Exp_Long_Term_Forecast
@@ -257,8 +321,6 @@ if __name__ == '__main__':
         for ii in range(args.itr):
             # setting record of experiments
             setup_seed(2021 + ii) # Reset seed for each iteration
-            
-            exp = Exp(args)  # set experiments
             setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
                 args.task_name,
                 args.model_id,
@@ -280,36 +342,42 @@ if __name__ == '__main__':
                 args.distil,
                 args.des, ii)
 
-            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-            
-            # [核心修改] 支持在线任务的不同模式
-            if args.task_name == 'online_forecast':
-                # 如果是 train_and_test 模式
-                if args.mode == 'train_and_test':
-                    # 1. 先离线预训练 (这里我们暂时调用 train, 实际上 online_forecast 的 train 继承自 long_term)
-                    # 为了方便，这里我们假设 task_name='long_term_forecast' 来训练 Backbone
-                    # 或者我们可以扩展 Exp_Online_Forecast 的 train 方法
-                    # 简单起见，这里复用 exp.train()，它继承自 Exp_Long_Term
-                    exp.train(setting)
-                    # 2. 再在线测试
-                    exp.online_test(setting, load_checkpoint=True)
-                else:
-                    # 其他模式不应该进入 is_training=1
-                    pass
-            else:
-                exp.train(setting)
-                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-                exp.test(setting)
+            log_path = os.path.join(args.log_dir, f'{setting}.log')
+            with tee_stdout_stderr(log_path):
+                configure_device(args)
+                print('Args in experiment:')
+                print_args(args)
+
+                exp = Exp(args)  # set experiments
+                print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
                 
-            if args.gpu_type == 'mps':
-                torch.backends.mps.empty_cache()
-            elif args.gpu_type == 'cuda':
-                torch.cuda.empty_cache()
+                # [核心修改] 支持在线任务的不同模式
+                if args.task_name == 'online_forecast':
+                    # 如果是 train_and_test 模式
+                    if args.mode == 'train_and_test':
+                        # 1. 先离线预训练 (这里我们暂时调用 train, 实际上 online_forecast 的 train 继承自 long_term)
+                        # 为了方便，这里我们假设 task_name='long_term_forecast' 来训练 Backbone
+                        # 或者我们可以扩展 Exp_Online_Forecast 的 train 方法
+                        # 简单起见，这里复用 exp.train()，它继承自 Exp_Long_Term
+                        exp.train(setting)
+                        # 2. 再在线测试
+                        exp.online_test(setting, load_checkpoint=True)
+                    else:
+                        # 其他模式不应该进入 is_training=1
+                        pass
+                else:
+                    exp.train(setting)
+                    print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                    exp.test(setting)
+                    
+                if args.gpu_type == 'mps':
+                    torch.backends.mps.empty_cache()
+                elif args.gpu_type == 'cuda':
+                    torch.cuda.empty_cache()
     else:
         # is_training = 0 (Testing Phase)
         setup_seed(2021)
         
-        exp = Exp(args)  # set experiments
         ii = 0
         setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_expand{}_dc{}_fc{}_eb{}_dt{}_{}_{}'.format(
             args.task_name,
@@ -332,25 +400,32 @@ if __name__ == '__main__':
             args.distil,
             args.des, ii)
 
-        print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-        
-        # [核心修改] 处理在线任务的各种 Mode
-        if args.task_name == 'online_forecast':
-            if args.mode == 'test_only':
-                exp.online_test(setting, load_checkpoint=True)
-            elif args.mode == 'ablation':
-                exp.ablation_study(setting)
-            elif args.mode == 'compare':
-                exp.compare_static_vs_online(setting)
-            elif args.mode == 'baseline':
-                exp.run_baselines(setting)
-            else:
-                # 默认行为
-                exp.online_test(setting, load_checkpoint=True)
-        else:
-            exp.test(setting, test=1)
+        log_path = os.path.join(args.log_dir, f'{setting}.log')
+        with tee_stdout_stderr(log_path):
+            configure_device(args)
+            print('Args in experiment:')
+            print_args(args)
+
+            exp = Exp(args)  # set experiments
+            print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             
-        if args.gpu_type == 'mps':
-            torch.backends.mps.empty_cache()
-        elif args.gpu_type == 'cuda':
-            torch.cuda.empty_cache()
+            # [核心修改] 处理在线任务的各种 Mode
+            if args.task_name == 'online_forecast':
+                if args.mode == 'test_only':
+                    exp.online_test(setting, load_checkpoint=True)
+                elif args.mode == 'ablation':
+                    exp.ablation_study(setting)
+                elif args.mode == 'compare':
+                    exp.compare_static_vs_online(setting)
+                elif args.mode == 'baseline':
+                    exp.run_baselines(setting)
+                else:
+                    # 默认行为
+                    exp.online_test(setting, load_checkpoint=True)
+            else:
+                exp.test(setting, test=1)
+                
+            if args.gpu_type == 'mps':
+                torch.backends.mps.empty_cache()
+            elif args.gpu_type == 'cuda':
+                torch.cuda.empty_cache()

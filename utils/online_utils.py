@@ -598,87 +598,201 @@ def save_predictions_to_csv(
     channel_names: Optional[List[str]] = None
 ):
     """
-    将预测结果保存为 CSV 文件
-    
+    将预测结果保存为 CSV 文件（优化内存使用，流式写入）
+
     Args:
         predictions: 预测值列表，每个元素形状为 [B, H, C]
         targets: 真实值列表，每个元素形状为 [B, H, C]
         save_dir: 保存目录
         setting: 实验设置名称
         reduce_overlap: 是否减少重叠 (只保存 Horizon=1 的点，以及少量的完整预测)
+        channel_names: 通道名称列表
     """
-    import pandas as pd
+    import csv
     import os
-    
-    # 合并所有批次
-    all_preds = np.concatenate(predictions, axis=0)  # [N, H, C]
-    all_targets = np.concatenate(targets, axis=0)    # [N, H, C]
-    
-    N, H, C = all_preds.shape
-    
-    # 1. 保存 "Streaming View" (Horizon=1) - 最常用
-    # 这代表了模型在每个时间步对"下一步"的预测
-    stream_rows = []
+
+    # 获取数据维度信息（从第一个批次）
+    if not predictions or not targets:
+        print("Warning: No predictions or targets to save.")
+        return
+
+    sample_shape = predictions[0].shape
+    if len(sample_shape) < 3:
+        print(f"Warning: Unexpected prediction shape {sample_shape}, expected [B, H, C]")
+        return
+
+    C = sample_shape[2]  # 通道数
     channel_labels = [f'channel_{c}' for c in range(C)] if not channel_names else channel_names
-    for t in range(N):
-        for c in range(C):
-            pred_val = all_preds[t, 0, c]
-            true_val = all_targets[t, 0, c]
-            stream_rows.append({
-                'step': t,
-                'channel': channel_labels[c],
-                'pred': pred_val,
-                'true': true_val,
-                'error': pred_val - true_val,
-                'abs_error': abs(pred_val - true_val)
-            })
-    
-    stream_df = pd.DataFrame(stream_rows)
+
+    # 1. 流式保存 "Streaming View" (Horizon=1) - 避免内存溢出
     stream_path = os.path.join(save_dir, f'{setting}_predictions_stream.csv')
-    stream_df.to_csv(stream_path, index=False, float_format='%.6f')
-    print(f"Streaming predictions (H=1) saved to {stream_path}")
-    
-    # 2. 生成可视化图表 (True vs Pred)
-    visualize_predictions_aligned(stream_df, save_dir, setting)
+
+    try:
+        with open(stream_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头
+            writer.writerow(['step', 'channel', 'pred', 'true', 'error', 'abs_error'])
+
+            # 逐批次写入，避免一次性加载所有数据到内存
+            step_counter = 0
+            for pred_batch, target_batch in zip(predictions, targets):
+                # pred_batch: [B, H, C], target_batch: [B, H, C]
+                batch_size = pred_batch.shape[0]
+
+                for b in range(batch_size):
+                    for c in range(C):
+                        # 只保存 H=1 的预测（第一个时间步）
+                        pred_val = float(pred_batch[b, 0, c])
+                        true_val = float(target_batch[b, 0, c])
+                        error = pred_val - true_val
+                        abs_error = abs(error)
+
+                        writer.writerow([
+                            step_counter,
+                            channel_labels[c],
+                            f'{pred_val:.6f}',
+                            f'{true_val:.6f}',
+                            f'{error:.6f}',
+                            f'{abs_error:.6f}'
+                        ])
+
+                    step_counter += 1
+
+        print(f"Streaming predictions (H=1) saved to {stream_path}")
+
+        # 2. 生成可视化图表 (True vs Pred)
+        # 为了避免重新读取大文件，我们使用采样方式可视化
+        visualize_predictions_aligned_streaming(predictions, targets, save_dir, setting, channel_labels)
+
+    except (OSError, IOError) as e:
+        print(f"Error: Failed to save predictions to {stream_path}: {e}")
+
+
+def visualize_predictions_aligned_streaming(
+    predictions: List[np.ndarray],
+    targets: List[np.ndarray],
+    save_dir: str,
+    setting: str,
+    channel_labels: List[str]
+):
+    """
+    可视化真实值与预测值曲线（流式处理，避免内存溢出）
+
+    Args:
+        predictions: 预测值列表
+        targets: 真实值列表
+        save_dir: 保存目录
+        setting: 实验设置名称
+        channel_labels: 通道标签列表
+    """
+    import matplotlib.pyplot as plt
+
+    # 采样策略：如果数据量太大，只可视化部分数据
+    total_steps = sum(pred.shape[0] for pred in predictions)
+    max_plot_steps = 2000  # 最多绘制 2000 个点
+
+    # 收集数据（采样）
+    step_counter = 0
+    channel_data = {c: {'steps': [], 'preds': [], 'trues': []} for c in range(len(channel_labels))}
+
+    sample_rate = max(1, total_steps // max_plot_steps)
+
+    for pred_batch, target_batch in zip(predictions, targets):
+        batch_size = pred_batch.shape[0]
+        for b in range(batch_size):
+            if step_counter % sample_rate == 0:  # 采样
+                for c in range(len(channel_labels)):
+                    channel_data[c]['steps'].append(step_counter)
+                    channel_data[c]['preds'].append(float(pred_batch[b, 0, c]))
+                    channel_data[c]['trues'].append(float(target_batch[b, 0, c]))
+            step_counter += 1
+
+    # 最多画 4 个通道
+    n_channels = len(channel_labels)
+    plot_channels = min(4, n_channels)
+
+    fig, axes = plt.subplots(plot_channels, 1, figsize=(15, 4 * plot_channels), sharex=True)
+    if plot_channels == 1:
+        axes = [axes]
+
+    for idx, ax in enumerate(axes):
+        data = channel_data[idx]
+        steps = np.array(data['steps'])
+        preds = np.array(data['preds'])
+        trues = np.array(data['trues'])
+
+        ax.plot(steps, trues, label='Ground Truth', color='black', alpha=0.6, linewidth=1.5)
+        ax.plot(steps, preds, label='Prediction (H=1)', color='dodgerblue', alpha=0.8, linewidth=1.5)
+
+        # 计算该通道的 MSE
+        mse = np.mean((preds - trues) ** 2)
+        ax.set_title(f'Channel {channel_labels[idx]} - MSE: {mse:.4f}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # 局部放大插图 (Zoom-in)
+        if len(steps) > 200:
+            start = len(steps) // 2
+            end = start + min(100, len(steps) - start)
+
+            # 创建插图
+            ins = ax.inset_axes([0.6, 0.6, 0.35, 0.35])
+            ins.plot(steps[start:end], trues[start:end], color='black', alpha=0.6)
+            ins.plot(steps[start:end], preds[start:end], color='dodgerblue', alpha=0.8)
+            ins.set_title('Zoom (100 steps)', fontsize=8)
+            ins.set_xticks([])
+            ins.set_yticks([])
+
+            # 指示插图位置
+            ax.indicate_inset_zoom(ins, edgecolor="black")
+
+    plt.xlabel('Time Step')
+    plt.tight_layout()
+
+    fig_path = os.path.join(save_dir, f'{setting}_forecast_comparison.png')
+    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    print(f"Forecast comparison figure saved to {fig_path}")
+    plt.close()
 
 
 def visualize_predictions_aligned(stream_df, save_dir, setting):
     """
     可视化真实值与预测值曲线 (基于 H=1 的流式预测)
+    [保留此函数以保持向后兼容性]
     """
     import matplotlib.pyplot as plt
     # import seaborn as sns
-    
+
     # 获取通道列表
     channels = stream_df['channel'].unique()
     n_channels = len(channels)
-    
+
     # 最多画 4 个通道，避免太拥挤
     plot_channels = channels[:min(4, n_channels)]
-    
+
     fig, axes = plt.subplots(len(plot_channels), 1, figsize=(15, 4 * len(plot_channels)), sharex=True)
     if len(plot_channels) == 1:
         axes = [axes]
-        
+
     for ax, c in zip(axes, plot_channels):
         data = stream_df[stream_df['channel'] == c]
-        
+
         ax.plot(data['step'], data['true'], label='Ground Truth', color='black', alpha=0.6, linewidth=1.5)
         ax.plot(data['step'], data['pred'], label='Prediction (H=1)', color='dodgerblue', alpha=0.8, linewidth=1.5)
-        
+
         # 计算该通道的 MSE
         mse = (data['error'] ** 2).mean()
         ax.set_title(f'Channel {c} - MSE: {mse:.4f}')
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
+
         # 局部放大插图 (Zoom-in)
         # 选取中间 100 个点
         if len(data) > 200:
             start = len(data) // 2
             end = start + 100
             zoom_data = data.iloc[start:end]
-            
+
             # 创建插图
             ins = ax.inset_axes([0.6, 0.6, 0.35, 0.35])
             ins.plot(zoom_data['step'], zoom_data['true'], color='black', alpha=0.6)
@@ -686,13 +800,13 @@ def visualize_predictions_aligned(stream_df, save_dir, setting):
             ins.set_title('Zoom (100 steps)', fontsize=8)
             ins.set_xticks([])
             ins.set_yticks([])
-            
+
             # 指示插图位置
             ax.indicate_inset_zoom(ins, edgecolor="black")
-            
+
     plt.xlabel('Time Step')
     plt.tight_layout()
-    
+
     fig_path = os.path.join(save_dir, f'{setting}_forecast_comparison.png')
     plt.savefig(fig_path, dpi=300, bbox_inches='tight')
     print(f"Forecast comparison figure saved to {fig_path}")

@@ -78,6 +78,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                min_len = min(outputs.shape[1], batch_y.shape[1])
+                if min_len <= 0:
+                    continue
+                if outputs.shape[1] != min_len:
+                    outputs = outputs[:, -min_len:, :]
+                if batch_y.shape[1] != min_len:
+                    batch_y = batch_y[:, -min_len:, :]
 
                 pred = outputs.detach()
                 true = batch_y.detach()
@@ -135,13 +142,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_loss_orth = []
 
             self.model.train()
-            if is_titan_stream and hasattr(self.model, "reset_memory"):
-                self.model.reset_memory()
+            # [修复] 移除 epoch 级别的记忆复位，改为 batch 级别
+            # if is_titan_stream and hasattr(self.model, "reset_memory"):
+            #     self.model.reset_memory()
             chunk_len_time = getattr(self.args, "chunk_len", 0)
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
+
+                # [修复 1.1] 每个 batch 开始时重置记忆（模拟每个序列独立的在线流）
+                if is_titan_stream and hasattr(self.model, "reset_memory"):
+                    self.model.reset_memory()
 
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
@@ -194,7 +206,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     chunk_loss_proxies = []
                     chunk_loss_orths = []
 
-                    for t_start, t_end in time_slices:
+                    # [修复 1.3] 训练时记忆延续：初始化临时记忆状态
+                    temp_memory = None
+                    temp_momentum = None
+
+                    for t, (t_start, t_end) in enumerate(time_slices):
                         x_slice = sub_x[:, t_start:t_end]
                         y_slice = sub_y[:, t_start:t_end]
                         y_mark_slice = sub_y_mark[:, t_start:t_end] if sub_y_mark is not None else None
@@ -205,12 +221,36 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         if self.args.use_amp:
                             with torch.cuda.amp.autocast():
                                 if is_titan_stream:
-                                    outputs = self.model(x_slice, use_state=False)
+                                    # [修复 1.3 + inplace] 第一个 chunk 使用初始记忆，后续 chunk 延续状态
+                                    # 通过参数传递而非 inplace 操作
+                                    update_state_for_chunk = use_high_order  # 仅在高阶模式下更新
+                                    differentiable_update_flag = use_high_order  # 高阶模式使用可微分更新
+
+                                    outputs = self.model(
+                                        x_slice,
+                                        use_state=False,  # 不使用 buffer
+                                        update_state=update_state_for_chunk,
+                                        differentiable_update=differentiable_update_flag,
+                                        external_memory=temp_memory,  # 传递外部记忆
+                                        external_momentum=temp_momentum  # 传递外部动量
+                                    )
                                 else:
                                     outputs = self.model(x_slice, x_mark_slice, dec_slice, y_mark_slice)
                         else:
                             if is_titan_stream:
-                                outputs = self.model(x_slice, use_state=False)
+                                # [修复 1.3 + inplace] 第一个 chunk 使用初始记忆，后续 chunk 延续状态
+                                # 通过参数传递而非 inplace 操作
+                                update_state_for_chunk = use_high_order  # 仅在高阶模式下更新
+                                differentiable_update_flag = use_high_order  # 高阶模式使用可微分更新
+
+                                outputs = self.model(
+                                    x_slice,
+                                    use_state=False,  # 不使用 buffer
+                                    update_state=update_state_for_chunk,
+                                    differentiable_update=differentiable_update_flag,
+                                    external_memory=temp_memory,  # 传递外部记忆
+                                    external_momentum=temp_momentum  # 传递外部动量
+                                )
                             else:
                                 outputs = self.model(x_slice, x_mark_slice, dec_slice, y_mark_slice)
 
@@ -219,17 +259,32 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     # ============================================================
                         loss_proxy = torch.tensor(0.0, device=self.device)
                         loss_orth = torch.tensor(0.0, device=self.device)
-                        
+
                         if isinstance(outputs, tuple):
                             pred = outputs[0]
                             if len(outputs) > 1 and isinstance(outputs[1], torch.Tensor):
                                 loss_proxy = outputs[1]
+                            # [修复 1.3] 提取更新后的记忆状态（如果有）
+                            if len(outputs) > 2 and isinstance(outputs[2], dict):
+                                stats = outputs[2]
+                                if stats.get('updated_memory') is not None:
+                                    temp_memory = stats['updated_memory']
+                                if stats.get('updated_momentum') is not None:
+                                    temp_momentum = stats['updated_momentum']
                         else:
                             pred = outputs
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         pred = pred[:, -self.args.pred_len:, f_dim:]
                         target_slice = y_slice[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        # 对齐长度，避免异常窗口导致维度不匹配
+                        min_len = min(pred.shape[1], target_slice.shape[1])
+                        if min_len <= 0:
+                            continue
+                        if pred.shape[1] != min_len:
+                            pred = pred[:, -min_len:, :]
+                        if target_slice.shape[1] != min_len:
+                            target_slice = target_slice[:, -min_len:, :]
 
                         # ============================================================
                         # 3. Loss Calculation
@@ -342,9 +397,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
-        folder_path = './test_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        folder_path = os.path.join(self.args.test_result_dir, setting)
+        os.makedirs(folder_path, exist_ok=True)
 
         self.model.eval()
         with torch.no_grad():
@@ -408,9 +462,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print('test shape:', preds.shape, trues.shape)
 
         # result save
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+        folder_path = os.path.join(self.args.result_dir, setting)
+        os.makedirs(folder_path, exist_ok=True)
 
         # dtw calculation
         if self.args.use_dtw:
@@ -449,16 +502,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print(f'MSPE: {mspe:.6f}')
         print(f'DTW:  {dtw}')
         print('='*60 + '\n')
-        
-        f = open("result_long_term_forecast.txt", 'a')
-        f.write(setting + "  \n")
-        f.write(f'MSE: {mse:.6f}, MAE: {mae:.6f}, RMSE: {rmse:.6f}, RSE: {rse:.6f}, R2: {r2:.6f}, MAPE: {mape:.6f}, MSPE: {mspe:.6f}, DTW: {dtw}\n')
-        f.write('\n')
-        f.write('\n')
-        f.close()
 
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe, rse, r2]))
-        np.save(folder_path + 'pred.npy', preds)
-        np.save(folder_path + 'true.npy', trues)
+        # 使用 with 语句安全地写入结果文件
+        result_file = os.path.join(self.args.result_dir, 'result_long_term_forecast.txt')
+        with open(result_file, 'a', encoding='utf-8') as f:
+            f.write(f"{setting}\n")
+            f.write(f'MSE: {mse:.6f}, MAE: {mae:.6f}, RMSE: {rmse:.6f}, RSE: {rse:.6f}, R2: {r2:.6f}, MAPE: {mape:.6f}, MSPE: {mspe:.6f}, DTW: {dtw}\n\n')
+
+        np.save(os.path.join(folder_path, 'metrics.npy'), np.array([mae, mse, rmse, mape, mspe, rse, r2]))
+        np.save(os.path.join(folder_path, 'pred.npy'), preds)
+        np.save(os.path.join(folder_path, 'true.npy'), trues)
 
         return

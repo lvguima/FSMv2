@@ -9,7 +9,7 @@ DATA_FILE=ETTh1.csv
 MODEL=TitanStream
 MODEL_ID=titan_delayed
 
-# Offline training (short)
+# Offline training
 python -u run.py \
   --task_name long_term_forecast \
   --is_training 1 \
@@ -19,12 +19,12 @@ python -u run.py \
   --root_path ${DATA_ROOT} \
   --data_path ${DATA_FILE} \
   --features M \
-  --seq_len 96 \
+  --seq_len 512 \
   --label_len 48 \
-  --pred_len 24 \
+  --pred_len 96 \
   --enc_in 7 --dec_in 7 --c_out 7 \
   --d_model 256 --n_heads 4 --e_layers 2 --d_ff 512 \
-  --train_epochs 1 --batch_size 8 --patience 1 \
+  --train_epochs 20 --batch_size 32 --patience 3 \
   --learning_rate 1e-3 \
   --chunk_size 0 \
   --chunk_len 0 \
@@ -43,9 +43,9 @@ python -u run.py \
   --root_path ${DATA_ROOT} \
   --data_path ${DATA_FILE} \
   --features M \
-  --seq_len 96 \
+  --seq_len 512 \
   --label_len 48 \
-  --pred_len 24 \
+  --pred_len 96 \
   --enc_in 7 --dec_in 7 --c_out 7 \
   --d_model 256 --n_heads 4 --e_layers 2 --d_ff 512 \
   --batch_size 8 \

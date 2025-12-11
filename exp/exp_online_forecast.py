@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 import os
+import sys
 import time
 import numpy as np
 from tqdm import tqdm
@@ -167,7 +168,24 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         extra_params = self._get_extra_params()
         is_titan_stream = (self.args.model == 'TitanStream') or (self.model.__class__.__name__ == 'TitanStream')
         
-        with tqdm(total=len(test_loader), desc="Online Testing") as pbar:
+        # 检测输出是否重定向到文件，如果是则禁用进度条以避免日志文件过大
+        # 方法1: 通过参数控制
+        disable_pbar = getattr(self.args, 'disable_progress_bar', False)
+        if not disable_pbar:
+            # 方法2: 检查 stdout 是否被 tee 包装（说明输出到文件）
+            # run.py 中的 tee_stdout_stderr 会创建 _TeeStream 类
+            if hasattr(sys.stdout, 'file_handle') or type(sys.stdout).__name__ == '_TeeStream':
+                disable_pbar = True
+            # 方法3: 检查原始流是否是终端
+            else:
+                try:
+                    original_stdout = getattr(sys.stdout, 'stream', sys.stdout)
+                    if hasattr(original_stdout, 'isatty'):
+                        disable_pbar = not original_stdout.isatty()
+                except:
+                    pass
+        
+        with tqdm(total=len(test_loader), desc="Online Testing", disable=disable_pbar, file=sys.stdout) as pbar:
             for step, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
@@ -271,14 +289,23 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
                 metrics.record_update(should_update, proxy_loss_value, supervised_updated, supervised_loss_value)
                 metrics.record_time(t_inference, t_update, t_supervised)
                 
-                pbar.update(1)
-                if (step + 1) % 100 == 0:
+                # 只在进度条启用时更新，避免日志文件过大
+                if not disable_pbar:
+                    pbar.update(1)
+                    if (step + 1) % 100 == 0:
+                        current_metrics = metrics.compute()
+                        pbar.set_postfix({
+                            'MSE': f"{current_metrics['mse']:.4f}",
+                            'P_Loss': f"{proxy_loss_value:.4f}",
+                            'S_Loss': f"{supervised_loss_value:.4f}"
+                        })
+                elif (step + 1) % 1000 == 0:
+                    # 即使进度条禁用，也定期打印进度信息到日志
                     current_metrics = metrics.compute()
-                    pbar.set_postfix({
-                        'MSE': f"{current_metrics['mse']:.4f}",
-                        'P_Loss': f"{proxy_loss_value:.4f}",
-                        'S_Loss': f"{supervised_loss_value:.4f}"
-                    })
+                    print(f"Progress: {step + 1}/{len(test_loader)} steps | "
+                          f"MSE: {current_metrics['mse']:.4f} | "
+                          f"P_Loss: {proxy_loss_value:.4f} | "
+                          f"S_Loss: {supervised_loss_value:.4f}")
         
         print("\nOnline Testing Completed!")
         final_metrics = metrics.compute()
@@ -313,7 +340,7 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
 
     def _save_results(self, setting, metrics, preds, targets):
         save_tag = f"{setting}_{self.online_strategy}"
-        save_dir = os.path.join('./results', save_tag)
+        save_dir = os.path.join(self.args.result_dir, save_tag)
         os.makedirs(save_dir, exist_ok=True)
         
         final_metrics = metrics.compute()
@@ -379,31 +406,47 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
     def _get_supervised_optimizer(self):
         """
         [V8] 获取全量微调的优化器 (双速学习率)
+        [修复] 针对 TitanStream 更新参数分组规则
         """
         if self._supervised_optimizer is None:
             # 临时解冻所有层以获取参数列表
             if hasattr(self.model, 'enable_backbone_grad'):
                 self.model.enable_backbone_grad()
-            
+
             # 分组参数
             backbone_params = []
             head_params = []
-            
-            # 识别 Backbone 参数 (Decomp, Linear, PatchEmbed, Encoder)
-            # 简单逻辑：名字里包含 backbone, encoder, embedding 的归为慢速组
-            # 其他 (memory, heads) 归为快速组
+
+            # [修复] 更新参数分组规则，兼容 TitanStream 和 MStream
+            # Backbone (慢速学习): core/encoder, input_proj, q/k/v_proj
+            # Head/Memory (快速学习): forecast_head, gate, memory, persistent
+            backbone_keywords = [
+                'backbone', 'encoder', 'embedding',  # MStream 原有
+                'core', 'input_proj', 'q_proj', 'k_proj', 'v_proj'  # TitanStream
+            ]
+            head_keywords = [
+                'memory', 'head', 'gate', 'persistent'  # TitanStream/MStream
+            ]
+
             for name, param in self.model.named_parameters():
                 if not param.requires_grad: continue
-                
-                if 'backbone' in name or 'encoder' in name or 'embedding' in name:
+
+                # 优先检查 head 关键词
+                is_head = any(kw in name for kw in head_keywords)
+                is_backbone = any(kw in name for kw in backbone_keywords)
+
+                if is_head and not is_backbone:
+                    head_params.append(param)
+                elif is_backbone:
                     backbone_params.append(param)
                 else:
+                    # 默认归为 head (快速学习)
                     head_params.append(param)
-            
+
             # 恢复冻结状态 (如果不是 Naive FT 全开模式)
             if self.online_strategy != 'naive_ft' and hasattr(self.model, 'disable_backbone_grad'):
                 self.model.disable_backbone_grad()
-            
+
             # 定义双速优化器
             # Backbone LR: 0.1 * naive_ft_lr (更稳)
             # Head/Memory LR: naive_ft_lr
@@ -416,7 +459,7 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
                     {'params': backbone_params, 'lr': self.naive_ft_lr * 0.1},
                     {'params': head_params, 'lr': self.naive_ft_lr}
                 ])
-            
+
             print(f"\n🔧 Initialized Dual-Speed Optimizer:")
             print(f"  Backbone Params: {len(backbone_params)} (LR: {self.naive_ft_lr * 0.1:.2e})")
             print(f"  Head/Mem Params: {len(head_params)} (LR: {self.naive_ft_lr:.2e})")

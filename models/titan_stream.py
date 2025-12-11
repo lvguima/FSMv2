@@ -29,6 +29,7 @@ class TitanStream(nn.Module):
         self.gate_hidden = getattr(configs, "gate_hidden", 128)
         self.dropout = getattr(configs, "dropout", 0.1)
         self.activation = getattr(configs, "activation", "gelu")
+        self.use_norm = getattr(configs, "use_norm", 1)
 
         # Input projection
         self.input_proj = nn.Linear(configs.enc_in, self.d_model)
@@ -79,6 +80,20 @@ class TitanStream(nn.Module):
             self.memory_state.copy_(self.memory_init.data)
             self.momentum_state.zero_()
 
+    def get_persistent_params(self):
+        """[修复 2.2] 返回 Persistent Memory 参数"""
+        return [self.persistent_k, self.persistent_v]
+
+    def freeze_persistent(self):
+        """[修复 2.2] 冻结 Persistent Memory"""
+        self.persistent_k.requires_grad = False
+        self.persistent_v.requires_grad = False
+
+    def unfreeze_persistent(self):
+        """[修复 2.2] 解冻 Persistent Memory（用于极低学习率微调）"""
+        self.persistent_k.requires_grad = True
+        self.persistent_v.requires_grad = True
+
     def _select_memory(self, use_state: bool):
         """
         Choose which memory matrix to use.
@@ -116,6 +131,37 @@ class TitanStream(nn.Module):
         context = torch.matmul(attn, self.persistent_v)
         return context
 
+    def _update_memory_differentiable(self, mem_matrix, momentum_matrix, grad_mem, gate_value):
+        """
+        [修复 1.2] 可微分的记忆更新（用于训练时的二阶梯度）
+
+        Args:
+            mem_matrix: [D, D] 当前记忆矩阵
+            momentum_matrix: [D, D] 当前动量矩阵
+            grad_mem: [D, D] 梯度（保留梯度图）
+            gate_value: scalar tensor in [0,1]
+
+        Returns:
+            new_memory: [D, D] 更新后的记忆
+            new_momentum: [D, D] 更新后的动量
+        """
+        # 动量更新（保留梯度）
+        new_momentum = self.beta_momentum * momentum_matrix + (1 - self.beta_momentum) * grad_mem
+
+        # 梯度归一化（保留梯度）
+        grad_norm = torch.norm(new_momentum)
+        max_grad_norm = 10.0  # [修复 2.1] 降低阈值从 1e3 到 10
+        new_momentum = torch.where(
+            (torch.isfinite(grad_norm) & (grad_norm > max_grad_norm)).unsqueeze(-1).unsqueeze(-1),
+            new_momentum * (max_grad_norm / (grad_norm + 1e-8)),
+            new_momentum
+        )
+
+        # 门控更新（保留梯度）
+        new_memory = (1 - gate_value) * mem_matrix - self.lr_memory * new_momentum
+
+        return new_memory, new_momentum
+
     def _update_online_memory(self, grad_mem, gate_value):
         """
         In-place online memory update using momentum and gate.
@@ -126,22 +172,37 @@ class TitanStream(nn.Module):
             self.momentum_state.mul_(self.beta_momentum).add_(grad_mem, alpha=1 - self.beta_momentum)
             # Optional normalization for stability
             grad_norm = torch.norm(self.momentum_state)
-            if torch.isfinite(grad_norm) and grad_norm > 1e3:
-                self.momentum_state.mul_(1e3 / grad_norm)
+            max_grad_norm = 10.0  # [修复 2.1] 降低阈值从 1e3 到 10
+            if torch.isfinite(grad_norm) and grad_norm > max_grad_norm:
+                self.momentum_state.mul_(max_grad_norm / grad_norm)
 
             self.memory_state.mul_(1 - gate_value).add_(self.momentum_state, alpha=-self.lr_memory)
 
-    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, use_state: bool = False, update_state: bool = False, **kwargs):
+    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, use_state: bool = False, update_state: bool = False, differentiable_update: bool = False, external_memory=None, external_momentum=None, **kwargs):
         """
         Args:
             x_enc: [B, L, C] input sequence
             use_state: if True, use mutable online memory buffers; else use learnable initializer
             update_state: if True and use_state, perform momentum+gate update in-place (no grad)
+            differentiable_update: [修复 1.2] if True, use differentiable update (for meta-learning)
+            external_memory: [修复 inplace] optional external memory state (for training with gradients)
+            external_momentum: [修复 inplace] optional external momentum state (for training with gradients)
         Returns:
             pred: [B, pred_len, c_out]
             proxy_loss: scalar tensor
             stats: dict with debug info (no grad requirement)
         """
+
+        if self.use_norm:
+            means = x_enc.mean(1, keepdim=True).detach()
+            x_enc = x_enc - means
+            stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-6)
+            stdev = torch.clamp(stdev, min=1e-3)
+            stdev = torch.nan_to_num(stdev, nan=1.0, posinf=1.0, neginf=1.0)
+            x_enc = torch.nan_to_num(x_enc / stdev, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            means, stdev = None, None
+        
         B, L, _ = x_enc.shape
         x_proj = self.input_proj(x_enc)  # [B, L, D]
 
@@ -149,7 +210,12 @@ class TitanStream(nn.Module):
         k = self.k_proj(x_proj)
         v = self.v_proj(x_proj)
 
-        mem_matrix = self._select_memory(use_state)
+        # [修复 inplace] 优先使用外部传入的记忆状态（避免 inplace 操作）
+        if external_memory is not None:
+            mem_matrix = external_memory
+        else:
+            mem_matrix = self._select_memory(use_state)
+
         h_mem, proxy_loss, grad_mem = self._neural_memory(mem_matrix, q, k, v)
         h_pers = self._persistent_memory(q)
 
@@ -161,17 +227,43 @@ class TitanStream(nn.Module):
 
         forecast = self.forecast_head(pooled)  # [B, pred_len * c_out]
         pred = forecast.view(B, self.pred_len, self.c_out)
-
+        # Denorm back to original scale if normalized
+        if self.use_norm and means is not None and stdev is not None:
+            pred = torch.nan_to_num(pred * stdev + means, nan=0.0, posinf=0.0, neginf=0.0)
         # Gate computed from pooled input
         gate_input = x_proj.mean(dim=1)
         gate_value = self.gate(gate_input).mean()  # scalar in [0,1]
 
-        if use_state and update_state:
-            self._update_online_memory(grad_mem.detach(), gate_value.detach())
+        # [修复 1.2] 记忆更新逻辑
+        updated_memory = None
+        updated_momentum = None
+
+        if update_state:
+            if differentiable_update:
+                # 可微分更新（训练时使用，保留梯度图）
+                # [修复 inplace] 使用外部传入的动量或零初始化
+                if external_momentum is not None:
+                    momentum_matrix = external_momentum
+                else:
+                    momentum_matrix = torch.zeros_like(mem_matrix)
+                updated_memory, updated_momentum = self._update_memory_differentiable(
+                    mem_matrix, momentum_matrix, grad_mem, gate_value
+                )
+            elif use_state:
+                # 原地更新（推理时使用，无梯度）
+                self._update_online_memory(grad_mem.detach(), gate_value.detach())
+
+        # Nan safety
+        proxy_loss = torch.nan_to_num(proxy_loss, nan=0.0, posinf=1e4, neginf=-1e4)
+        grad_mem = torch.nan_to_num(grad_mem, nan=0.0, posinf=0.0, neginf=0.0)
 
         stats = {
             "gate": gate_value.detach(),
             "proxy_loss": proxy_loss.detach(),
             "grad_norm": torch.norm(grad_mem.detach()),
+            "mean": means if means is None else means.detach(),
+            "std": stdev if stdev is None else stdev.detach(),
+            "updated_memory": updated_memory,  # 可微分更新的新记忆（如果有）
+            "updated_momentum": updated_momentum,  # 可微分更新的新动量（如果有）
         }
         return pred, proxy_loss, stats

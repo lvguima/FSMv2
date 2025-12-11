@@ -124,7 +124,12 @@ class OnlineMetrics:
         Args:
             gate_value: 门控值 (0~1)
         """
-        self.gate_values.append(gate_value)
+        if hasattr(gate_value, "detach"):
+            try:
+                gate_value = gate_value.detach().cpu().item()
+            except Exception:
+                gate_value = float(gate_value.detach().cpu().numpy())
+        self.gate_values.append(float(gate_value))
     
     def compute(self) -> Dict[str, float]:
         """
@@ -944,7 +949,10 @@ class DelayedFeedbackBuffer:
         max_buffer_size: int = 200,
         max_wait_steps: int = 20,
         weight_decay: float = 0.05,
-        supervised_weight: float = 0.7
+        supervised_weight: float = 0.7,
+        weight_temperature: float = 1.0,
+        anomaly_boost: float = 1.0,
+        min_ready_for_anomaly: int = 1
     ):
         """
         Args:
@@ -960,6 +968,9 @@ class DelayedFeedbackBuffer:
         self.max_buffer_size = max_buffer_size
         self.max_wait_steps = max_wait_steps
         self.weight_decay = weight_decay
+        self.weight_temperature = max(weight_temperature, 1e-6)
+        self.anomaly_boost = anomaly_boost
+        self.min_ready_for_anomaly = max(1, min_ready_for_anomaly)
         self.supervised_weight = supervised_weight
         
         # Replay Buffer: 存储等待标签的样本
@@ -977,6 +988,9 @@ class DelayedFeedbackBuffer:
         self.last_update_step = 0
         self.total_supervised_updates = 0
         self.total_samples_used = 0
+        self.anomaly_trigger_count = 0
+        self.last_update_reason = ""
+        self.last_is_anomaly = False
     
     def add_sample(self, step: int, batch_x: torch.Tensor, enc_out: Optional[torch.Tensor]):
         """
@@ -1087,14 +1101,21 @@ class DelayedFeedbackBuffer:
             return True
         
         # 条件 2: 检测到异常且有可用样本
-        if is_anomaly and len(self.ready_queue) > 0:
+        if is_anomaly and len(self.ready_queue) >= self.min_ready_for_anomaly:
+            self.anomaly_trigger_count += 1
+            self.last_is_anomaly = True
+            self.last_update_reason = "anomaly"
             return True
         
         # 条件 3: 超时强制更新
         steps_since_update = current_step - self.last_update_step
         if steps_since_update >= self.max_wait_steps and len(self.ready_queue) > 0:
+            self.last_is_anomaly = False
+            self.last_update_reason = "timeout"
             return True
         
+        self.last_is_anomaly = False
+        self.last_update_reason = ""
         return False
     
     def get_batch(self) -> Optional[Tuple[List, np.ndarray]]:
@@ -1114,15 +1135,18 @@ class DelayedFeedbackBuffer:
         batch_data = self.ready_queue[:num_samples]
         self.ready_queue = self.ready_queue[num_samples:]
         
-        # 计算时间衰减权重
-        # weight_i = exp(-λ * (current_step - step_i))
+        # 计算时间衰减权重 + 温度 + 异常加权
+        # weight_i = softmax(-λ * Δt / T)
         weights = []
         for step, _, _, _ in batch_data:
             time_diff = self.current_step - step
-            weight = np.exp(-self.weight_decay * time_diff)
+            weight = np.exp(-self.weight_decay * time_diff / self.weight_temperature)
             weights.append(weight)
         
-        weights = np.array(weights)
+        weights = np.array(weights, dtype=np.float64)
+        if self.last_is_anomaly and self.anomaly_boost != 1.0:
+            weights = weights * self.anomaly_boost
+        
         # 归一化权重 (避免除零错误)
         weights_sum = weights.sum()
         if weights_sum > 0:
@@ -1153,7 +1177,10 @@ class DelayedFeedbackBuffer:
                 self.total_samples_used / self.total_supervised_updates
                 if self.total_supervised_updates > 0 else 0.0
             ),
-            'steps_since_last_update': self.current_step - self.last_update_step
+            'steps_since_last_update': self.current_step - self.last_update_step,
+            'anomaly_trigger_count': self.anomaly_trigger_count,
+            'last_update_reason': self.last_update_reason,
+            'last_is_anomaly': self.last_is_anomaly
         }
     
     def reset(self):

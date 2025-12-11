@@ -106,6 +106,8 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         print("\n" + "="*60)
         print("Starting Online Testing for M-Stream (V8: Fast/Slow)")
         print("="*60)
+        if hasattr(self.model, "reset_memory"):
+            self.model.reset_memory()
         
         test_data, test_loader = self._get_data(flag='test')
         print(f"✓ Test samples: {len(test_data)}")
@@ -113,6 +115,10 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         print(f"✓ Online Strategy: {self.online_strategy}")
         print("\nStarting online inference...\n")
         resolved_ckpt = checkpoint_path or self._resolve_checkpoint_path(setting, self.checkpoint_setting)
+        # Fallback: try corresponding long_term_forecast checkpoint if online setting not found
+        if resolved_ckpt is None and self.args.task_name == 'online_forecast':
+            offline_setting = setting.replace('online_forecast', 'long_term_forecast', 1)
+            resolved_ckpt = self._resolve_checkpoint_path(offline_setting, self.checkpoint_setting)
         if load_checkpoint:
             if resolved_ckpt and os.path.exists(resolved_ckpt):
                 print(f"\nLoading pretrained model from: {resolved_ckpt}")
@@ -144,7 +150,10 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
                 max_buffer_size=200,
                 max_wait_steps=self.delayed_max_wait_steps,
                 weight_decay=self.delayed_weight_decay,
-                supervised_weight=self.delayed_supervised_weight
+                supervised_weight=self.delayed_supervised_weight,
+                weight_temperature=getattr(self.args, "delayed_weight_temperature", 1.0),
+                anomaly_boost=getattr(self.args, "delayed_anomaly_boost", 1.0),
+                min_ready_for_anomaly=getattr(self.args, "delayed_min_ready", 1)
             )
             print(f"\n✓ Delayed Feedback enabled (Batch: {self.delayed_batch_size}, Horizon: {self.delayed_horizon})")
             print(f"  -> Backbone will be fine-tuned during delayed updates (Slow Learning).")
@@ -156,6 +165,7 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         all_targets = []
         enable_proxy_updates = self.online_strategy in ['proxy', 'proxy_delayed', 'proxy_supervised']
         extra_params = self._get_extra_params()
+        is_titan_stream = (self.args.model == 'TitanStream') or (self.model.__class__.__name__ == 'TitanStream')
         
         with tqdm(total=len(test_loader), desc="Online Testing") as pbar:
             for step, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
@@ -169,31 +179,53 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
                 is_anomaly = False
 
                 if enable_proxy_updates:
-                    with torch.enable_grad():
-                        # 确保此时 Backbone 是冻结的 (除了 Trend)
-                        _, proxy_loss, _ = self.model(batch_x, mode='online')
-                        proxy_loss_value = proxy_loss.item()
-                        
+                    if is_titan_stream:
+                        # Titan-Stream: 先计算代理损失做门控判断，再按需更新内部记忆状态
+                        with torch.no_grad():
+                            _, proxy_loss, _ = self.model(batch_x, use_state=True, update_state=False)
+                            proxy_loss_value = proxy_loss.item()
+
                         if self.use_surprise_gate:
                             should_update, gate_info = surprise_gate.should_update(proxy_loss_value)
                             is_anomaly = gate_info.get('is_anomaly', False)
                         else:
                             should_update = True
-                        
+
                         if should_update:
-                            # 使用 Momentum SGD 更新 Memory (快速适应)
-                            self.model.memory.update_with_momentum(proxy_loss, extra_params=extra_params)
+                            with torch.no_grad():
+                                # 使用内部 momentum + gate 更新在线记忆
+                                self.model(batch_x, use_state=True, update_state=True)
+                    else:
+                        with torch.enable_grad():
+                            # 确保此时 Backbone 是冻结的 (除了 Trend)
+                            _, proxy_loss, _ = self.model(batch_x, mode='online')
+                            proxy_loss_value = proxy_loss.item()
+                            
+                            if self.use_surprise_gate:
+                                should_update, gate_info = surprise_gate.should_update(proxy_loss_value)
+                                is_anomaly = gate_info.get('is_anomaly', False)
+                            else:
+                                should_update = True
+                            
+                            if should_update and hasattr(self.model, 'memory'):
+                                # 使用 Momentum SGD 更新 Memory (快速适应)
+                                self.model.memory.update_with_momentum(proxy_loss, extra_params=extra_params)
 
                 t_update = time.time() - t_update_start
 
                 # ========== Step 2: Prediction ==========
                 t_start = time.time()
                 with torch.no_grad():
-                    pred, _, debug_info = self.model(batch_x, mode='online')
+                    if is_titan_stream:
+                        pred, _, debug_info = self.model(batch_x, use_state=True, update_state=False)
+                    else:
+                        pred, _, debug_info = self.model(batch_x, mode='online')
                 t_inference = time.time() - t_start
                 
                 if 'gate_value' in debug_info:
                     metrics.record_gate(debug_info['gate_value'])
+                elif 'gate' in debug_info:
+                    metrics.record_gate(debug_info['gate'])
                 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 target = batch_y[:, -self.args.pred_len:, f_dim:]
@@ -216,14 +248,16 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
                     if delayed_buffer.should_update(step, is_anomaly):
                         batch_data, weights = delayed_buffer.get_batch()
                         if batch_data is not None:
-                            # [V8 核心] 临时解冻 Backbone 进行全量微调
-                            self.model.enable_backbone_grad()
+                            # [V8 核心] 临时解冻 Backbone 进行全量微调（如可用）
+                            if hasattr(self.model, 'enable_backbone_grad'):
+                                self.model.enable_backbone_grad()
                             
                             # 使用 Adam 优化器更新所有参数
                             supervised_loss_value = self._supervised_update_adam(batch_data, weights)
                             
                             # 恢复冻结状态
-                            self.model.disable_backbone_grad()
+                            if hasattr(self.model, 'disable_backbone_grad'):
+                                self.model.disable_backbone_grad()
                             
                             supervised_updated = True
                 
@@ -335,7 +369,8 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         
         # 确保 Memory 模块可训练 (TTT需要)
         if strategy in ['proxy', 'proxy_delayed', 'proxy_supervised']:
-            for param in self.model.memory.parameters(): param.requires_grad = True
+            if hasattr(self.model, 'memory'):
+                for param in self.model.memory.parameters(): param.requires_grad = True
             if hasattr(self.model, 'head_proxy'): 
                 for param in self.model.head_proxy.parameters(): param.requires_grad = True
             if hasattr(self.model, 'memory_scale'): 
@@ -372,10 +407,15 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
             # 定义双速优化器
             # Backbone LR: 0.1 * naive_ft_lr (更稳)
             # Head/Memory LR: naive_ft_lr
-            self._supervised_optimizer = optim.Adam([
-                {'params': backbone_params, 'lr': self.naive_ft_lr * 0.1},
-                {'params': head_params, 'lr': self.naive_ft_lr}
-            ])
+            if len(backbone_params) + len(head_params) == 0:
+                return None
+            if len(backbone_params) == 0:
+                self._supervised_optimizer = optim.Adam(head_params, lr=self.naive_ft_lr)
+            else:
+                self._supervised_optimizer = optim.Adam([
+                    {'params': backbone_params, 'lr': self.naive_ft_lr * 0.1},
+                    {'params': head_params, 'lr': self.naive_ft_lr}
+                ])
             
             print(f"\n🔧 Initialized Dual-Speed Optimizer:")
             print(f"  Backbone Params: {len(backbone_params)} (LR: {self.naive_ft_lr * 0.1:.2e})")
@@ -390,6 +430,8 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         if not batch_data: return 0.0
         
         optimizer = self._get_supervised_optimizer()
+        if optimizer is None:
+            return 0.0
         criterion = nn.MSELoss(reduction='none')
         total_loss = 0.0
         
@@ -401,10 +443,20 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         # batch_data list of tuples: (step, x, y, enc_out)
         xs = torch.cat([item[1] for item in batch_data], dim=0) # [B_total, ...]
         ys = torch.cat([item[2] for item in batch_data], dim=0) # [B_total, ...]
-        ws = torch.tensor(weights, device=self.device).float()  # [B_total]
+        # 权重与样本对齐：若样本数超出权重，重复/截断；若权重不足则广播
+        ws = torch.tensor(weights, device=self.device).float()  # [N_weights]
+        if ws.numel() == 1:
+            ws = ws.expand(xs.size(0))
+        elif ws.numel() != xs.size(0):
+            repeat_factor = int(torch.ceil(torch.tensor(xs.size(0) / ws.numel())).item())
+            ws = ws.repeat(repeat_factor)[:xs.size(0)]
         
         # 2. Forward
-        pred, _, _ = self.model(xs, mode='online')
+        # TitanStream 兼容：无 mode 参数
+        if hasattr(self.model, 'forward') and 'mode' in self.model.forward.__code__.co_varnames:
+            pred, _, _ = self.model(xs, mode='online')
+        else:
+            pred, _, _ = self.model(xs, use_state=True, update_state=False)
         f_dim = -1 if self.args.features == 'MS' else 0
         target = ys[:, -self.args.pred_len:, f_dim:]
         pred = pred[:, -self.args.pred_len:, f_dim:]
@@ -427,7 +479,10 @@ class Exp_Online_Forecast(Exp_Long_Term_Forecast):
         
         with torch.enable_grad():
             # 重新计算带梯度的 pred
-            pred_grad, _, _ = self.model(batch_x, mode='online')
+            if hasattr(self.model, 'forward') and 'mode' in self.model.forward.__code__.co_varnames:
+                pred_grad, _, _ = self.model(batch_x, mode='online')
+            else:
+                pred_grad, _, _ = self.model(batch_x, use_state=True, update_state=False)
             f_dim = -1 if self.args.features == 'MS' else 0
             pred_grad = pred_grad[:, -self.args.pred_len:, f_dim:]
             

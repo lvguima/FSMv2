@@ -42,6 +42,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
+        is_titan_stream = (self.args.model == 'TitanStream')
+        if is_titan_stream and hasattr(self.model, "reset_memory"):
+            self.model.reset_memory()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
                 batch_x = batch_x.float().to(self.device)
@@ -56,9 +59,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        model_output = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        if is_titan_stream:
+                            model_output = self.model(batch_x, use_state=False)
+                        else:
+                            model_output = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    model_output = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    if is_titan_stream:
+                        model_output = self.model(batch_x, use_state=False)
+                    else:
+                        model_output = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 
                 # v6.0 FIX: Handle MStream returning (pred, enc_out) in offline mode
                 if isinstance(model_output, tuple):
@@ -78,12 +87,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()
+        if is_titan_stream and hasattr(self.model, "reset_memory"):
+            self.model.reset_memory()
         return total_loss
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        is_titan_stream = (self.args.model == 'TitanStream')
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -123,76 +135,150 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_loss_orth = []
 
             self.model.train()
+            if is_titan_stream and hasattr(self.model, "reset_memory"):
+                self.model.reset_memory()
+            chunk_len_time = getattr(self.args, "chunk_len", 0)
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-                
+
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
                 # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                dec_inp_full = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                dec_inp_full = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp_full], dim=1).float().to(self.device)
 
-                # ============================================================
-                # 1. Forward Pass (前向传播)
-                # ============================================================
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                # 支持按 batch 维度的分块累积，降低显存
+                chunk_size = getattr(self.args, "chunk_size", 0)
+                use_high_order = getattr(self.args, "use_high_order", False)
+                num_chunks = 0
+                loss_chunks = []
+                loss_pred_vals = []
+                loss_proxy_vals = []
+                loss_orth_vals = []
+                backward_in_slices = False  # True 表示时间片内部已执行 backward（截断高阶）
 
-                # ============================================================
-                # 2. Output Unpacking (解包 M-Stream 输出)
-                # ============================================================
-                loss_proxy = torch.tensor(0.0, device=self.device)
-                loss_orth = torch.tensor(0.0, device=self.device)
-                
-                # 检查是否为 M-Stream 返回的元组 (pred, loss_proxy, info)
-                if isinstance(outputs, tuple):
-                    pred = outputs[0]
-                    # 如果返回元组长度 > 1，且第二个元素是 Tensor，则认为是 Proxy Loss
-                    if len(outputs) > 1 and isinstance(outputs[1], torch.Tensor):
-                        loss_proxy = outputs[1]
-                else:
-                    pred = outputs
+                batch_indices = [(0, batch_x.size(0))] if chunk_size <= 0 else [
+                    (s, min(s + chunk_size, batch_x.size(0))) for s in range(0, batch_x.size(0), chunk_size)
+                ]
 
-                # 裁剪预测结果以匹配 Pred_Len
-                f_dim = -1 if self.args.features == 'MS' else 0
-                pred = pred[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                for s, e in batch_indices:
+                    num_chunks += 1
+                    sub_x = batch_x[s:e]
+                    sub_y = batch_y[s:e]
+                    sub_x_mark = batch_x_mark[s:e]
+                    sub_y_mark = batch_y_mark[s:e]
+                    dec_inp = dec_inp_full[s:e]
 
-                # ============================================================
-                # 3. Loss Calculation (计算总损失)
-                # ============================================================
-                # A. 预测 Loss
-                loss_pred = criterion(pred, batch_y)
+                    # 可选的时间维 chunk（Titan 专用，要求 chunk_len >= pred_len）
+                    if is_titan_stream and chunk_len_time > 0 and chunk_len_time >= self.args.pred_len and chunk_len_time < self.args.seq_len:
+                        time_slices = []
+                        seq_len = sub_x.size(1)
+                        for t in range(0, seq_len, chunk_len_time):
+                            t_end = min(t + chunk_len_time, seq_len)
+                            if t_end - t < self.args.pred_len:
+                                break
+                            time_slices.append((t, t_end))
+                    else:
+                        time_slices = [(0, sub_x.size(1))]
 
-                # B. 正交 Loss (仅当模型有 memory 模块且系数 > 0 时计算)
-                lambda_orth = getattr(self.args, 'lambda_orth', 0.0)
-                if lambda_orth > 0 and hasattr(self.model, 'memory') and hasattr(self.model.memory, 'compute_orthogonal_loss'):
-                    loss_orth = self.model.memory.compute_orthogonal_loss()
-                
-                # C. 加权求和
-                lambda_proxy = getattr(self.args, 'lambda_proxy', 0.0)
-                loss = loss_pred + lambda_proxy * loss_proxy + lambda_orth * loss_orth
-                
+                    # ============================================================
+                    # 1. Forward Pass
+                    # ============================================================
+                    chunk_losses = []
+                    chunk_loss_preds = []
+                    chunk_loss_proxies = []
+                    chunk_loss_orths = []
+
+                    for t_start, t_end in time_slices:
+                        x_slice = sub_x[:, t_start:t_end]
+                        y_slice = sub_y[:, t_start:t_end]
+                        y_mark_slice = sub_y_mark[:, t_start:t_end] if sub_y_mark is not None else None
+                        x_mark_slice = sub_x_mark[:, t_start:t_end] if sub_x_mark is not None else None
+                        # decoder input与时间片对齐（防止越界）
+                        dec_slice = dec_inp[:, :y_slice.size(1)] if dec_inp is not None else None
+
+                        if self.args.use_amp:
+                            with torch.cuda.amp.autocast():
+                                if is_titan_stream:
+                                    outputs = self.model(x_slice, use_state=False)
+                                else:
+                                    outputs = self.model(x_slice, x_mark_slice, dec_slice, y_mark_slice)
+                        else:
+                            if is_titan_stream:
+                                outputs = self.model(x_slice, use_state=False)
+                            else:
+                                outputs = self.model(x_slice, x_mark_slice, dec_slice, y_mark_slice)
+
+                    # ============================================================
+                    # 2. Output Unpacking
+                    # ============================================================
+                        loss_proxy = torch.tensor(0.0, device=self.device)
+                        loss_orth = torch.tensor(0.0, device=self.device)
+                        
+                        if isinstance(outputs, tuple):
+                            pred = outputs[0]
+                            if len(outputs) > 1 and isinstance(outputs[1], torch.Tensor):
+                                loss_proxy = outputs[1]
+                        else:
+                            pred = outputs
+
+                        f_dim = -1 if self.args.features == 'MS' else 0
+                        pred = pred[:, -self.args.pred_len:, f_dim:]
+                        target_slice = y_slice[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                        # ============================================================
+                        # 3. Loss Calculation
+                        # ============================================================
+                        loss_pred = criterion(pred, target_slice)
+
+                        lambda_orth = getattr(self.args, 'lambda_orth', 0.0)
+                        if lambda_orth > 0 and hasattr(self.model, 'memory') and hasattr(self.model.memory, 'compute_orthogonal_loss'):
+                            loss_orth = self.model.memory.compute_orthogonal_loss()
+                        
+                        lambda_proxy = getattr(self.args, 'lambda_proxy', 0.0)
+                        loss_total = loss_pred + lambda_proxy * loss_proxy + lambda_orth * loss_orth
+
+                        chunk_loss_preds.append(loss_pred.item())
+                        chunk_loss_proxies.append(loss_proxy.item())
+                        chunk_loss_orths.append(loss_orth.item())
+
+                        # 截断一阶：时间片内直接反向传播，避免跨片高阶图
+                        if (not use_high_order) and len(time_slices) > 1:
+                            backward_in_slices = True
+                            if self.args.use_amp:
+                                scaler.scale(loss_total).backward()
+                            else:
+                                loss_total.backward()
+                        else:
+                            chunk_losses.append(loss_total)
+
+                    # 汇总时间片损失
+                    if not backward_in_slices:
+                        loss_chunk_mean = torch.stack(chunk_losses).mean() if len(chunk_losses) > 1 else chunk_losses[0]
+                        loss_chunks.append(loss_chunk_mean)
+                    loss_pred_vals.append(sum(chunk_loss_preds) / len(chunk_loss_preds))
+                    loss_proxy_vals.append(sum(chunk_loss_proxies) / len(chunk_loss_proxies))
+                    loss_orth_vals.append(sum(chunk_loss_orths) / len(chunk_loss_orths))
+
+                loss = torch.stack(loss_chunks).mean() if len(loss_chunks) > 1 else (loss_chunks[0] if loss_chunks else torch.tensor(0.0, device=self.device))
+
                 # 记录日志
                 train_loss.append(loss.item())
-                train_loss_pred.append(loss_pred.item())
-                train_loss_proxy.append(loss_proxy.item())
-                train_loss_orth.append(loss_orth.item())
+                train_loss_pred.append(sum(loss_pred_vals) / len(loss_pred_vals))
+                train_loss_proxy.append(sum(loss_proxy_vals) / len(loss_proxy_vals))
+                train_loss_orth.append(sum(loss_orth_vals) / len(loss_orth_vals))
 
                 # ============================================================
                 # 4. Logging & Scheduler Step
                 # ============================================================
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | total: {2:.7f} | pred: {3:.7f} | proxy: {4:.7f} | orth: {5:.7f}".format(
-                        i + 1, epoch + 1, loss.item(), loss_pred.item(), loss_proxy.item(), loss_orth.item()))
+                        i + 1, epoch + 1, loss.item(), train_loss_pred[-1], train_loss_proxy[-1], train_loss_orth[-1]))
                     
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
@@ -200,20 +286,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                # [关键] Scheduler Step 必须在 Batch 循环内 (针对 OneCycleLR)
                 if self.args.lradj == 'TST':
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
 
                 # ============================================================
-                # 5. Backward Pass (反向传播)
+                # 5. Backward Pass
                 # ============================================================
+                if not backward_in_slices:
+                    if self.args.use_amp:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                clip_norm = getattr(self.args, "clip_grad", 0.0)
+                if clip_norm > 0:
+                    if self.args.use_amp:
+                        scaler.unscale_(model_optim)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_norm)
+
                 if self.args.use_amp:
-                    scaler.scale(loss).backward()
                     scaler.step(model_optim)
                     scaler.update()
                 else:
-                    loss.backward()
                     model_optim.step()
 
             # End of Epoch Loop
